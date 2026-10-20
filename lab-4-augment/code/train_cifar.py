@@ -66,7 +66,8 @@ parser.add_argument(
 )
 parser.add_argument("--data-aug-hflip", action="store_true")
 parser.add_argument("--data-aug-zoom", action="store_true")
-parser.add_argument("--data-aug-brightness", action="store_true", default=0, type=float)
+parser.add_argument("--data-aug-brightness", default=0.0, type=float)
+parser.add_argument("--dropout", default=0, type=float)
 
 class ImageShape(NamedTuple):
     height: int
@@ -74,28 +75,36 @@ class ImageShape(NamedTuple):
     channels: int
 
 if torch.cuda.is_available():
-    DEVICE = torch.device("conda")
+    DEVICE = torch.device("cuda")
 else:
     DEVICE = torch.device("cpu")
 
 
 def main(args):
 
-    test_transform = transforms.ToTensor()
-
-    train_transform = transforms.Compose([
-
-        *([transforms.ColorJitter(brightness=args.data_aug_brightness)
-        if args.data_aug_brightness != 0 else []]),
-
-        *([transforms.RandomHorizontalFlip()]
-        if args.data_aug_hflip else []),
-
-        *([transforms.RandomAffine(degrees=0, scale=(0.8, 1.2))]
-        if args.data_aug_zoom else []),
-
-        transforms.ToTensor()
+    test_transform = transforms.Compose([
+    transforms.ToTensor(),
     ])
+
+    train_transforms = []
+
+    if args.data_aug_brightness > 0:
+        train_transforms.append(
+            transforms.ColorJitter(brightness=args.data_aug_brightness)
+        )
+
+    if args.data_aug_hflip:
+        train_transforms.append(
+            transforms.RandomHorizontalFlip()
+        )
+
+    if args.data_aug_zoom:
+        train_transforms.append(
+            transforms.RandomAffine(degrees=0, scale=(0.8, 1))
+        )
+
+    train_transforms.append(transforms.ToTensor())
+    train_transform = transforms.Compose(train_transforms)
 
     args.dataset_root.mkdir(parents=True, exist_ok=True)
     train_dataset = torchvision.datasets.CIFAR10(
@@ -119,7 +128,7 @@ def main(args):
         pin_memory=True,
     )
 
-    model = CNN(height=32, width=32, channels=3, class_count=10)
+    model = CNN(height=32, width=32, channels=3, class_count=10, dropout=args.dropout)
 
     ## TASK 8: Redefine the criterion to be softmax cross entropy
     criterion = nn.CrossEntropyLoss()
@@ -148,8 +157,11 @@ def main(args):
 
 
 class CNN(nn.Module):
-    def __init__(self, height: int, width: int, channels: int, class_count: int):
+    def __init__(self, height: int, width: int, channels: int, class_count: int, dropout: float):
         super().__init__()
+
+        self.dropout = nn.Dropout(dropout)
+
         self.input_shape = ImageShape(height=height, width=width, channels=channels)
         self.class_count = class_count
 
@@ -197,10 +209,10 @@ class CNN(nn.Module):
         ##         (batch_size, 4096)
         x = torch.flatten(x, start_dim=1)
         ## TASK 5-2: Pass x through the first fully connected layer
-        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc1(self.dropout(x)))
         x = self.norm3(x)
         ## TASK 6-2: Pass x through the last fully connected layer
-        return self.fc2(x)
+        return self.fc2(self.dropout(x))
 
     @staticmethod
     def initialise_layer(layer):
@@ -338,6 +350,11 @@ class Trainer:
         accuracy = compute_accuracy(
             np.array(results["labels"]), np.array(results["preds"])
         )
+
+        per_class_accuracy = compute_per_class_accuracy(
+            np.array(results["labels"]), np.array(results["preds"])
+        )
+
         average_loss = total_loss / len(self.val_loader)
 
         self.summary_writer.add_scalars(
@@ -351,7 +368,57 @@ class Trainer:
                 self.step
         )
         print(f"validation loss: {average_loss:.5f}, accuracy: {accuracy * 100:2.2f}")
+        for class_name, class_accuracy in per_class_accuracy.items():
+            print(f"  {class_name}: {class_accuracy * 100:.2f}%")
 
+def compute_per_class_accuracy(
+    labels: Union[torch.Tensor, np.ndarray],
+    preds: Union[torch.Tensor, np.ndarray]
+) -> dict:
+    """
+    Calculate accuracy separately for each CIFAR-10 class.
+
+    Args:
+        labels: Ground-truth class indices.
+        preds: Predicted class indices.
+
+    Returns:
+        Dictionary mapping each class name to its accuracy.
+    """
+    assert len(labels) == len(preds)
+
+    per_class_accuracy = {}
+
+    for i, c in enumerate(classes):
+        # Select examples whose true label is class i
+        mask = labels == i
+
+        # Count examples belonging to this class
+        class_count = mask.sum()
+
+        if class_count > 0:
+            # Calculate fraction of correctly classified examples
+            correct = (preds[mask] == labels[mask]).sum()
+            accuracy = float(correct) / int(class_count)
+        else:
+            accuracy = 0.0
+
+        per_class_accuracy[c] = accuracy
+
+    return per_class_accuracy
+
+classes = [
+    "airplane",
+    "automobile",
+    "bird",
+    "cat",
+    "deer",
+    "dog",
+    "frog",
+    "horse",
+    "ship",
+    "truck"
+]
 
 def compute_accuracy(
     labels: Union[torch.Tensor, np.ndarray], preds: Union[torch.Tensor, np.ndarray]
@@ -379,6 +446,7 @@ def get_summary_writer_log_dir(args: argparse.Namespace) -> str:
     """
     tb_log_dir_prefix = (
         f"CNN_bn_"
+        f"dropout={args.dropout}_"
         f"bs={args.batch_size}_"
         f"lr={args.learning_rate}_"
         f"momentum=0.9_" +
